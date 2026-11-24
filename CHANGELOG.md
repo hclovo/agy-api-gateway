@@ -4,6 +4,21 @@
 
 ---
 
+## [0.4.1] - 2026-11-24
+
+### Fixed
+- **修复多轮复用时 `usage` 跨轮累加导致客户端（Codex / Claude Code）误触发“上下文已自动压缩”的 Bug**
+  - `agy --conversation` 在 `result.usage` 中返回的是从第 1 轮起的会话累计值，而每个 `step_update.usage` 才是单步真实用量。`AgyRunner` 现按 `step_index` 聚合本轮 `step_update.usage`：以最后一步的 `(input_tokens, cache_read_tokens)` 作为当前上下文真实占用，仅累加本轮内部多步（如媒体 `read_file`）的 `output_tokens` / `thinking_tokens`，禁止被跨轮累加的 `result.usage` 覆盖（仅在无 `step_update.usage` 时回退 `result.usage`）。
+- **严格对齐 OpenAI / Gemini / Anthropic 三协议的缓存与思考 Token 语义**
+  - OpenAI `_openai_usage_dict`：`prompt_tokens = input_tokens + cache_read_tokens`（严格保证 `prompt_tokens >= prompt_tokens_details.cached_tokens`），`completion_tokens` 包含 `reasoning_tokens`，`total_tokens = prompt_tokens + completion_tokens`。
+  - Gemini `_gemini_usage_dict`：`promptTokenCount` 包含 `cachedContentTokenCount`（并透出该字段），`candidatesTokenCount` 扣减已计入 `output_tokens` 的 `thoughtsTokenCount` 避免重复计数。
+  - Anthropic `_anthropic_usage_dict`：保持 `input_tokens` 与 `cache_read_input_tokens` 分离，同时修复 100% 缓存命中（`input_tokens=0, cache_read_tokens>0`）时误加回退估算值导致双计的边界问题。
+- **修复 Codex `AGENTS.md` / `<INSTRUCTIONS>` 样板导致的会话指纹碰撞与摘要错抓**
+  - `extract_clean_human_intent` 与 `compute_session_fingerprint` 扩展剥离 Codex 注入的 `# AGENTS.md instructions`、`<INSTRUCTIONS>`、`<environment_context>`、`<permissions instructions>`、`<collaboration_mode>`、`<user_instructions>` 等样板，并跳过纯样板前置消息以锁定真实用户目标。
+  - 请求头与请求体新增支持 Codex `prompt_cache_key`、`session-id` / `session_id`、`thread-id`、`conversation-id` 及 Claude Code `metadata.user_id`（含 `session` 标识），同时移除容易跨会话冲突的通用 `body.user` 键。
+
+---
+
 ## [0.4.0] - 2026-11-24
 
 ### Added

@@ -1,6 +1,6 @@
 [project]
 name = "agy-api-gateway"
-version = "0.4.0"
+version = "0.4.1"
 description = "API gateway exposing OpenAI/Gemini/Anthropic-compatible endpoints backed by Google Antigravity CLI (agy)"
 readme = "README.md"
 requires-python = ">=3.11"

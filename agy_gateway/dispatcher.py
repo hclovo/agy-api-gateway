@@ -940,7 +940,7 @@ class AgyDispatcher:
                     detected_email = None if acc.email else detect_email_from_logs(acc.resolved_home())
                     self.account_store.record_success(
                         acc.id,
-                        input_tokens=final_usage.input_tokens,
+                        input_tokens=final_usage.total_input_tokens,
                         output_tokens=final_usage.output_tokens,
                         detected_email=detected_email,
                     )

@@ -146,3 +146,81 @@ def test_oversized_500kb_tools_and_history_never_truncate_latest_user_message() 
     assert "[Conversation]" in prompt
     assert prompt.endswith("FINAL_USER_QUESTION_MUST_STAY_INTACT_999")
 
+
+def test_protocol_accurate_usage_translation_and_session_hint_scoping() -> None:
+    """Verify OpenAI, Gemini, and Anthropic usage contracts for cached & thinking tokens."""
+    # `agy` reports input_tokens (uncached=2245), cache_read_tokens=7994, output_tokens=649 (includes 369 thinking)
+    usage = UsageInfo(
+        input_tokens=2245,
+        output_tokens=649,
+        thinking_tokens=369,
+        cache_read_tokens=7994,
+        total_tokens=2894,
+    )
+
+    # 1. OpenAI: prompt_tokens INCLUDES cached_tokens; completion_tokens INCLUDES reasoning_tokens
+    oa = format_openai_chat_completion("ok", model="gpt-4o", usage=usage)
+    assert oa["usage"]["prompt_tokens"] == 2245 + 7994
+    assert oa["usage"]["prompt_tokens_details"]["cached_tokens"] == 7994
+    assert oa["usage"]["prompt_tokens"] >= oa["usage"]["prompt_tokens_details"]["cached_tokens"]
+    assert oa["usage"]["completion_tokens"] == 649
+    assert oa["usage"]["completion_tokens_details"]["reasoning_tokens"] == 369
+    assert oa["usage"]["total_tokens"] == (2245 + 7994) + 649
+
+    # 2. Gemini: promptTokenCount INCLUDES cached; candidatesTokenCount EXCLUDES thoughts (no double count!)
+    gem = format_gemini_response("ok", usage=usage)
+    um = gem["usageMetadata"]
+    assert um["promptTokenCount"] == 2245 + 7994
+    assert um["cachedContentTokenCount"] == 7994
+    assert um["candidatesTokenCount"] == 649 - 369
+    assert um["thoughtsTokenCount"] == 369
+    assert um["totalTokenCount"] == um["promptTokenCount"] + um["candidatesTokenCount"] + um["thoughtsTokenCount"]
+
+    # 3. Anthropic: input_tokens and cache_read_input_tokens remain disjoint
+    ant = format_anthropic_response("ok", model="claude-opus-5-5-high", usage=usage)
+    assert ant["usage"]["input_tokens"] == 2245
+    assert ant["usage"]["cache_read_input_tokens"] == 7994
+    assert ant["usage"]["output_tokens"] == 649
+
+    # 4. Anthropic 100% cache hit (input_tokens=0, cache_read_tokens=8000) must NOT inject fallback_input_tokens
+    from agy_gateway.adapters import _anthropic_usage_dict
+
+    full_cache_u = _anthropic_usage_dict(
+        UsageInfo(input_tokens=0, output_tokens=12, cache_read_tokens=8000),
+        fallback_input_tokens=9999,
+    )
+    assert full_cache_u["input_tokens"] == 0
+    assert full_cache_u["cache_read_input_tokens"] == 8000
+
+    # 5. Session hints: accept prompt_cache_key & Claude Code session user_id; ignore generic OpenAI `user`
+    r_codex = parse_openai_request(
+        {
+            "model": "gpt-4o",
+            "prompt_cache_key": "thread-xyz",
+            "user": "generic-alice",
+            "messages": [{"role": "user", "content": "hi"}],
+        },
+        default_model="gemini-3.8-flash-high",
+    )
+    assert r_codex.session_id == "thread-xyz"
+
+    r_generic_user = parse_openai_request(
+        {
+            "model": "gpt-4o",
+            "user": "generic-alice",
+            "messages": [{"role": "user", "content": "hi"}],
+        },
+        default_model="gemini-3.8-flash-high",
+    )
+    assert r_generic_user.session_id is None
+
+    r_claude_code = parse_anthropic_request(
+        {
+            "model": "claude-opus-5-5-high",
+            "metadata": {"user_id": "user_abc_account_123_session_550e8400-e29b-41d4"},
+            "messages": [{"role": "user", "content": "hi"}],
+        },
+        default_model="claude-opus-5-5-high",
+    )
+    assert r_claude_code.session_id == "user_abc_account_123_session_550e8400-e29b-41d4"
+

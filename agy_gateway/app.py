@@ -149,7 +149,17 @@ def _require_admin(request: Request, settings: Settings) -> None:
 
 
 def _extract_session_header(request: Request) -> Optional[str]:
-    for hdr in ("x-session-id", "x-conversation-id", "x-thread-id"):
+    for hdr in (
+        "x-session-id",
+        "session-id",
+        "session_id",
+        "x-conversation-id",
+        "conversation-id",
+        "conversation_id",
+        "x-thread-id",
+        "thread-id",
+        "thread_id",
+    ):
         val = request.headers.get(hdr)
         if val and val.strip():
             return val.strip()
@@ -263,7 +273,7 @@ async def _complete_with_accounting(
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
     key_store.record_usage(
-        key_record.id, result.usage.input_tokens, result.usage.output_tokens
+        key_record.id, result.usage.total_input_tokens, result.usage.output_tokens
     )
     return result
 
@@ -288,7 +298,7 @@ async def _stream_with_accounting(
     finally:
         key_store.record_usage(
             key_record.id,
-            input_tokens=final_usage.input_tokens,
+            input_tokens=final_usage.total_input_tokens,
             output_tokens=final_usage.output_tokens,
         )
 

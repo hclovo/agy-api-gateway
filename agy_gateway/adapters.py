@@ -31,10 +31,19 @@ def sse_event(event_name: str, payload: Dict[str, Any]) -> str:
 
 
 def _openai_usage_dict(usage: UsageInfo) -> Dict[str, Any]:
-    total = usage.total_tokens or (usage.input_tokens + usage.output_tokens)
+    """Format per-turn usage strictly per OpenAI Chat Completions specification.
+
+    OpenAI requires:
+    - `prompt_tokens` INCLUDES `prompt_tokens_details.cached_tokens` (`prompt_tokens >= cached_tokens`)
+    - `completion_tokens` INCLUDES `completion_tokens_details.reasoning_tokens`
+    - `total_tokens == prompt_tokens + completion_tokens`
+    """
+    prompt_tokens = usage.input_tokens + usage.cache_read_tokens
+    completion_tokens = max(usage.output_tokens, usage.thinking_tokens)
+    total = prompt_tokens + completion_tokens
     out: Dict[str, Any] = {
-        "prompt_tokens": usage.input_tokens,
-        "completion_tokens": usage.output_tokens,
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
         "total_tokens": total,
     }
     if usage.cache_read_tokens > 0:
@@ -45,13 +54,27 @@ def _openai_usage_dict(usage: UsageInfo) -> Dict[str, Any]:
 
 
 def _gemini_usage_dict(usage: UsageInfo) -> Dict[str, int]:
-    total = usage.total_tokens or (usage.input_tokens + usage.output_tokens)
-    return {
-        "promptTokenCount": usage.input_tokens,
-        "candidatesTokenCount": usage.output_tokens,
-        "thoughtsTokenCount": usage.thinking_tokens,
+    """Format per-turn usage strictly per Google Gemini `usageMetadata` specification.
+
+    Gemini requires:
+    - `promptTokenCount` INCLUDES `cachedContentTokenCount`
+    - `candidatesTokenCount` EXCLUDES `thoughtsTokenCount` (since `agy`'s `output_tokens`
+      already includes `thinking_tokens`, we subtract to avoid double-counting)
+    - `totalTokenCount == promptTokenCount + candidatesTokenCount + thoughtsTokenCount`
+    """
+    prompt_tokens = usage.input_tokens + usage.cache_read_tokens
+    thoughts = max(0, usage.thinking_tokens)
+    candidates = max(0, usage.output_tokens - thoughts)
+    total = prompt_tokens + candidates + thoughts
+    out: Dict[str, int] = {
+        "promptTokenCount": prompt_tokens,
+        "candidatesTokenCount": candidates,
+        "thoughtsTokenCount": thoughts,
         "totalTokenCount": total,
     }
+    if usage.cache_read_tokens > 0:
+        out["cachedContentTokenCount"] = usage.cache_read_tokens
+    return out
 
 
 def _anthropic_usage_dict(
@@ -60,7 +83,13 @@ def _anthropic_usage_dict(
     fallback_input_tokens: int = 0,
     include_input: bool = True,
 ) -> Dict[str, int]:
-    in_tok = usage.input_tokens if usage.input_tokens > 0 else fallback_input_tokens
+    """Format per-turn usage strictly per Anthropic Messages API specification.
+
+    Anthropic keeps `input_tokens` (uncached) and `cache_read_input_tokens` (cached)
+    disjoint; clients sum both to compute active context occupancy.
+    """
+    has_real_input = usage.input_tokens > 0 or usage.cache_read_tokens > 0
+    in_tok = usage.input_tokens if has_real_input else fallback_input_tokens
     out: Dict[str, int] = {"output_tokens": usage.output_tokens}
     if include_input:
         out["input_tokens"] = in_tok
@@ -72,15 +101,20 @@ def _anthropic_usage_dict(
 def _extract_session_hint(body: Dict[str, Any], header_session_id: Optional[str] = None) -> Optional[str]:
     if header_session_id and header_session_id.strip():
         return header_session_id.strip()
+    for top_key in ("prompt_cache_key", "session_id", "conversation_id", "thread_id"):
+        val = body.get(top_key)
+        if isinstance(val, str) and val.strip():
+            return val.strip()
     meta = body.get("metadata")
     if isinstance(meta, dict):
-        for key in ("session_id", "conversation_id", "thread_id", "user_id"):
+        for key in ("session_id", "conversation_id", "thread_id", "prompt_cache_key"):
             val = meta.get(key)
             if isinstance(val, str) and val.strip():
                 return val.strip()
-    user_val = body.get("user")
-    if isinstance(user_val, str) and user_val.strip():
-        return user_val.strip()
+        # Claude Code encodes per-session UUID in metadata.user_id (`user_..._session_<uuid>`)
+        uid = meta.get("user_id")
+        if isinstance(uid, str) and uid.strip() and "session" in uid.lower():
+            return uid.strip()
     return None
 
 
@@ -750,7 +784,7 @@ async def iter_anthropic_sse(
             if chunk.done:
                 final_usage = chunk.usage
                 continue
-            if chunk.usage.input_tokens > 0:
+            if chunk.usage.input_tokens > 0 or chunk.usage.cache_read_tokens > 0:
                 final_usage = chunk.usage
             if chunk.text_delta:
                 buffered.append(chunk.text_delta)
@@ -850,7 +884,7 @@ async def iter_anthropic_sse(
         async for chunk in chunks:
             if chunk.finish_reason:
                 stream_finish_reason = chunk.finish_reason
-            if chunk.usage.input_tokens > 0 or chunk.done:
+            if chunk.usage.input_tokens > 0 or chunk.usage.cache_read_tokens > 0 or chunk.done:
                 final_usage = chunk.usage
             if not started:
                 yield make_message_start(final_usage)

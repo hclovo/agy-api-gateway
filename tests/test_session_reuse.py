@@ -419,3 +419,187 @@ def test_production_bug_fixes_boilerplate_windows_paths_and_media_prefix_hash(tm
         )
     ]
     assert compute_prefix_hash(m_turn_1) == compute_prefix_hash(m_turn_2)
+
+
+def test_agy_runner_uses_per_turn_step_usage_over_cumulative_result_usage(tmp_path: Path) -> None:
+    """`agy --conversation` emits session-cumulative `result.usage`; runner must report per-turn `step_update.usage`."""
+    # 1. Resumed single-step turn: result.usage is inflated across prior turns
+    fake_single = tmp_path / "fake_agy_cum_single.py"
+    fake_single.write_text(
+        f"#!{sys.executable}\n"
+        "import json, sys\n"
+        "sys.stdin.readline()\n"
+        'print(json.dumps({"event": "init", "conversation_id": "conv-abc"}), flush=True)\n'
+        'print(json.dumps({"event": "step_update", "step_update": {"conversation_id": "conv-abc", "step_index": 7, "text_delta": "GAMMA", "usage": {"input_tokens": 2239, "output_tokens": 1, "thinking_tokens": 0, "cache_read_tokens": 8203, "total_tokens": 2240}}}), flush=True)\n'
+        'print(json.dumps({"event": "result", "result": {"conversation_id": "conv-abc", "status": "SUCCESS", "response": "GAMMA", "usage": {"input_tokens": 14521, "output_tokens": 4, "thinking_tokens": 0, "cache_read_tokens": 16197, "total_tokens": 14525}}}), flush=True)\n',
+        encoding="utf-8",
+    )
+    fake_single.chmod(fake_single.stat().st_mode | stat.S_IXUSR)
+    runner = AgyRunner(agy_bin=str(fake_single), workdir=tmp_path / "w1")
+    text, usage, cid = asyncio.run(
+        runner.complete_prompt(prompt="next", model="gemini-3.8-flash-low", conversation_id="conv-abc")
+    )
+    assert text == "GAMMA"
+    assert cid == "conv-abc"
+    assert usage.input_tokens == 2239
+    assert usage.cache_read_tokens == 8203
+    assert usage.total_input_tokens == 10442
+    assert usage.output_tokens == 1
+    assert usage.total_tokens == 10443
+
+    # 2. Multi-step internal turn (e.g. read_file on staged image + reply): take LAST step input/cache, sum THIS turn outputs
+    fake_multi = tmp_path / "fake_agy_cum_multi.py"
+    fake_multi.write_text(
+        f"#!{sys.executable}\n"
+        "import json, sys\n"
+        "sys.stdin.readline()\n"
+        'print(json.dumps({"event": "init", "conversation_id": "conv-img"}), flush=True)\n'
+        'print(json.dumps({"event": "step_update", "step_update": {"conversation_id": "conv-img", "step_index": 13, "usage": {"input_tokens": 60699, "output_tokens": 342, "thinking_tokens": 100, "cache_read_tokens": 7853, "total_tokens": 61041}}}), flush=True)\n'
+        'print(json.dumps({"event": "step_update", "step_update": {"conversation_id": "conv-img", "step_index": 19, "text_delta": "Image inspected.", "usage": {"input_tokens": 6214, "output_tokens": 962, "thinking_tokens": 300, "cache_read_tokens": 68553, "total_tokens": 7176}}}), flush=True)\n'
+        'print(json.dumps({"event": "result", "result": {"conversation_id": "conv-img", "status": "SUCCESS", "response": "Image inspected.", "usage": {"input_tokens": 123099, "output_tokens": 2784, "thinking_tokens": 900, "cache_read_tokens": 195061, "total_tokens": 125883}}}), flush=True)\n',
+        encoding="utf-8",
+    )
+    fake_multi.chmod(fake_multi.stat().st_mode | stat.S_IXUSR)
+    runner2 = AgyRunner(agy_bin=str(fake_multi), workdir=tmp_path / "w2")
+    _, usage2, _ = asyncio.run(
+        runner2.complete_prompt(prompt="inspect", model="gemini-4-neon-high", conversation_id="conv-img")
+    )
+    assert usage2.input_tokens == 6214
+    assert usage2.cache_read_tokens == 68553
+    assert usage2.total_input_tokens == 74767
+    assert usage2.output_tokens == 342 + 962
+    assert usage2.thinking_tokens == 100 + 300
+    assert usage2.total_tokens == 74767 + 342 + 962
+
+    # 3. Fallback to result.usage when no step_update.usage is present
+    fake_fallback = tmp_path / "fake_agy_result_only.py"
+    fake_fallback.write_text(
+        f"#!{sys.executable}\n"
+        "import json, sys\n"
+        "sys.stdin.readline()\n"
+        'print(json.dumps({"event": "result", "result": {"conversation_id": "conv-fb", "status": "SUCCESS", "response": "ok", "usage": {"input_tokens": 55, "output_tokens": 7, "total_tokens": 62}}}), flush=True)\n',
+        encoding="utf-8",
+    )
+    fake_fallback.chmod(fake_fallback.stat().st_mode | stat.S_IXUSR)
+    runner3 = AgyRunner(agy_bin=str(fake_fallback), workdir=tmp_path / "w3")
+    _, usage3, _ = asyncio.run(runner3.complete_prompt(prompt="hi", model="gemini-3.8-flash-low"))
+    assert usage3.input_tokens == 55
+    assert usage3.output_tokens == 7
+
+
+def test_codex_boilerplate_stripping_and_session_hints(tmp_path: Path) -> None:
+    """Codex AGENTS.md/<INSTRUCTIONS>/<environment_context> boilerplate must not collide sessions or pollute goals."""
+    codex_prefix = (
+        "# AGENTS.md instructions for C:\\workspace\\demo-3d\n\n"
+        "<INSTRUCTIONS>\n"
+        + ("Repo rule line for sample-workspace-skill.\n" * 60)
+        + "</INSTRUCTIONS><environment_context>\n"
+        "  <cwd>C:\\workspace\\demo-3d</cwd>\n"
+        "  <shell>powershell</shell>\n"
+        "</environment_context>"
+        "<permissions instructions>\nFilesystem unrestricted.\n</permissions instructions>"
+    )
+    task_a = "用threejs纯代码的形式优化美术和画质，让其像3a游戏大作"
+    task_b = "给地图加上夜间霓虹招牌和雨天路面反射"
+
+    # 1. Combined in msg #1
+    assert extract_clean_human_intent(codex_prefix + task_a) == task_a
+    req_a = NormalizedRequest(
+        model="gemini-4-neon-high",
+        system_prompt="Codex system prompt",
+        messages=[ChatMessage(role="user", content=codex_prefix + task_a)],
+    )
+    req_b = NormalizedRequest(
+        model="gemini-4-neon-high",
+        system_prompt="Codex system prompt",
+        messages=[ChatMessage(role="user", content=codex_prefix + task_b)],
+    )
+    assert compute_session_fingerprint(req_a) != compute_session_fingerprint(req_b)
+
+    # 2. Split across separate pure-boilerplate leading user messages
+    req_split_a = NormalizedRequest(
+        model="gemini-4-neon-high",
+        system_prompt="Codex system prompt",
+        messages=[
+            ChatMessage(role="user", content=codex_prefix),
+            ChatMessage(role="user", content=task_a),
+        ],
+    )
+    req_split_b = NormalizedRequest(
+        model="gemini-4-neon-high",
+        system_prompt="Codex system prompt",
+        messages=[
+            ChatMessage(role="user", content=codex_prefix),
+            ChatMessage(role="user", content=task_b),
+        ],
+    )
+    assert compute_session_fingerprint(req_split_a) != compute_session_fingerprint(req_split_b)
+
+    # 3. Checkpoint Primary Goal captures real task (not AGENTS.md boilerplate)
+    msgs = [
+        ChatMessage(role="user", content=codex_prefix),
+        ChatMessage(role="user", content=task_a),
+    ]
+    for i in range(1, 14):
+        msgs.append(ChatMessage(role="assistant", content=f"step {i} " + ("X" * 1000)))
+        msgs.append(ChatMessage(role="user", content=f"next {i}"))
+    mgr = ContextManager(mode="deterministic", keep_recent_bytes=3_000, checkpoint_max_bytes=3_000)
+    res = mgr.build_context(NormalizedRequest(model="gemini-4-neon-high", messages=msgs), max_bytes=10_000)
+    assert task_a in res.prompt
+    assert "sample-workspace-skill" not in res.prompt
+
+    # 4. Codex `prompt_cache_key` and `session-id` header isolate sessions even with identical messages
+    runner = ResumableFakeRunner()
+    client, ks, _, _ = _make_reuse_client(tmp_path, runner)
+    _, raw_key = ks.create_key(name="codex-client", rpm_limit=60)
+    hdr = {"Authorization": f"Bearer {raw_key}"}
+
+    runner.next_reply = "reply-1"
+    r1 = client.post(
+        "/v1/chat/completions",
+        headers={**hdr, "session-id": "codex-thread-aaa"},
+        json={
+            "model": "gemini-3.8-flash-high",
+            "messages": [{"role": "user", "content": "Hello"}],
+        },
+    )
+    assert r1.status_code == 200
+    assert r1.headers["X-Agy-Session-Reused"] == "false"
+
+    # Same messages + prompt_cache_key for a DIFFERENT thread must NOT reuse thread-aaa
+    runner.next_reply = "reply-2"
+    r2 = client.post(
+        "/v1/chat/completions",
+        headers=hdr,
+        json={
+            "model": "gemini-3.8-flash-high",
+            "prompt_cache_key": "codex-thread-bbb",
+            "messages": [
+                {"role": "user", "content": "Hello"},
+                {"role": "assistant", "content": "reply-1"},
+                {"role": "user", "content": "Follow up"},
+            ],
+        },
+    )
+    assert r2.status_code == 200
+    assert r2.headers["X-Agy-Session-Reused"] == "false"
+
+    # Continuing thread-aaa with session-id header MUST reuse agy-conv-1
+    runner.next_reply = "reply-3"
+    r3 = client.post(
+        "/v1/chat/completions",
+        headers={**hdr, "session-id": "codex-thread-aaa"},
+        json={
+            "model": "gemini-3.8-flash-high",
+            "messages": [
+                {"role": "user", "content": "Hello"},
+                {"role": "assistant", "content": "reply-1"},
+                {"role": "user", "content": "Follow up"},
+            ],
+        },
+    )
+    assert r3.status_code == 200
+    assert r3.headers["X-Agy-Session-Reused"] == "true"
+    assert r3.json()["usage"]["prompt_tokens"] == 200  # 120 uncached + 80 cached
+    assert r3.json()["usage"]["prompt_tokens_details"]["cached_tokens"] == 80
+    assert r3.json()["usage"]["total_tokens"] == 210  # 200 + 10 output

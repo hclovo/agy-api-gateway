@@ -39,8 +39,14 @@ _THINKING_BLOCK_RE = re.compile(r"<(?:thinking|thought)>.*?</(?:thinking|thought
 _CODE_FENCE_OPEN_RE = re.compile(r"^```(?:json)?\s*\n?", re.IGNORECASE)
 _CODE_FENCE_CLOSE_RE = re.compile(r"\n?```\s*$")
 _BOILERPLATE_TAG_RE = re.compile(
-    r"<(system-reminder|identity_context|user_info|environment_details|attached_files)\b[^>]*>.*?</\1>",
+    r"<(system-reminder|identity_context|user_info|environment_details|attached_files|"
+    r"instructions|environment_context|user_instructions|collaboration_mode|app-context|"
+    r"turn_aborted|permissions\s+instructions)\b[^>]*>.*?</\1>",
     re.DOTALL | re.IGNORECASE,
+)
+_AGENTS_MD_HEADER_RE = re.compile(
+    r"^\s*#\s*AGENTS\.md\s+instructions[^\n]*\n?",
+    re.IGNORECASE | re.MULTILINE,
 )
 _NUMBERED_FILE_LINE_RE = re.compile(r"^\s*\d+→")
 _EPHEMERAL_MEDIA_PATH_RE = re.compile(r"(?:/[^\s\]\"']*?)?/media_[0-9a-f]{16}/[^\s\]\"']+")
@@ -733,18 +739,19 @@ def _normalize_ephemeral_media_paths(text: str) -> str:
     return _EPHEMERAL_MEDIA_PATH_RE.sub("[archived media attachment]", text)
 
 
-def extract_clean_human_intent(text: str) -> str:
-    """Strip injected harness boilerplate (`<system-reminder>`, `SOUL.md`, numbered dumps)
-    so the user's real task instruction is never crowded out of checkpoints or fingerprints.
-    """
+def _strip_boilerplate_only(text: str) -> str:
+    """Strip harness boilerplate tags and numbered inline dumps; returns empty string if pure boilerplate."""
     if not text:
         return ""
+    had_instructions_tag = bool(re.search(r"<instructions\b", text, re.IGNORECASE))
     cleaned = text
     for _ in range(4):
         updated = _BOILERPLATE_TAG_RE.sub("", cleaned)
         if updated == cleaned:
             break
         cleaned = updated
+    if had_instructions_tag:
+        cleaned = _AGENTS_MD_HEADER_RE.sub("", cleaned)
     cleaned = _normalize_ephemeral_media_paths(cleaned)
 
     # Collapse long runs of numbered file lines (` 123→...`) injected by editor harnesses
@@ -771,10 +778,20 @@ def extract_clean_human_intent(text: str) -> str:
 
     result = "\n".join(kept_lines).strip()
     # Collapse excessive blank lines
-    result = re.sub(r"\n{3,}", "\n\n", result).strip()
+    return re.sub(r"\n{3,}", "\n\n", result).strip()
+
+
+def extract_clean_human_intent(text: str) -> str:
+    """Strip injected harness boilerplate (`<system-reminder>`, `SOUL.md`, Codex `AGENTS.md` /
+    `<INSTRUCTIONS>` / `<environment_context>`, numbered dumps) so the user's real task
+    instruction is never crowded out of checkpoints or fingerprints.
+    """
+    if not text:
+        return ""
+    result = _strip_boilerplate_only(text)
     if result:
         return result
-    # If everything was wrapped inside tags, keep the tail where user instructions usually appear
+    # If everything was wrapped inside tags, keep the normalized original text as fallback
     return _normalize_ephemeral_media_paths(text.strip())
 
 
@@ -1279,6 +1296,7 @@ def build_deterministic_checkpoint(
 
     # Extract durable structured state from prefix_messages
     human_msgs: List[Tuple[int, str]] = []
+    raw_fallback_human: Optional[Tuple[int, str]] = None
     assistant_milestones: List[Tuple[int, str]] = []
     files_read: List[str] = []
     files_written: List[str] = []
@@ -1292,9 +1310,11 @@ def build_deterministic_checkpoint(
 
     for idx, msg in enumerate(prefix_messages):
         if _is_genuine_human_message(msg) and msg.content.strip():
-            clean_user = extract_clean_human_intent(msg.content)
+            clean_user = _strip_boilerplate_only(msg.content)
             if clean_user:
                 human_msgs.append((idx + 1, clean_user))
+            elif raw_fallback_human is None:
+                raw_fallback_human = (idx + 1, extract_clean_human_intent(msg.content))
         elif msg.role == "assistant":
             clean_txt = _normalize_ephemeral_media_paths(_strip_stale_thinking(msg.content)).strip()
             # Filter out leaked raw tool wrapper blobs from milestones
@@ -1353,6 +1373,9 @@ def build_deterministic_checkpoint(
                     files_read.append(fp)
                     if len(files_read) >= 20:
                         break
+
+    if not human_msgs and raw_fallback_human is not None:
+        human_msgs.append(raw_fallback_human)
 
     sections: List[str] = [header]
 
@@ -1458,8 +1481,15 @@ def compute_session_fingerprint(req: NormalizedRequest) -> str:
     first_human = ""
     for msg in req.messages:
         if _is_genuine_human_message(msg) and msg.content.strip():
-            first_human = extract_clean_human_intent(msg.content)[:1024]
-            break
+            candidate = _strip_boilerplate_only(msg.content)
+            if candidate:
+                first_human = candidate[:1024]
+                break
+    if not first_human:
+        for msg in req.messages:
+            if _is_genuine_human_message(msg) and msg.content.strip():
+                first_human = extract_clean_human_intent(msg.content)[:1024]
+                break
     if not first_human and req.messages:
         first_human = extract_clean_human_intent(req.messages[0].content)[:1024]
 

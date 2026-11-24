@@ -47,13 +47,25 @@ class AgyModelInfo:
 
 @dataclass(frozen=True)
 class UsageInfo:
-    """Token accounting reported by agy stream-json events."""
+    """Per-turn token accounting normalized from agy stream-json events.
+
+    Semantics match `agy`'s per-step events:
+    - `input_tokens`: non-cached prompt tokens (excludes `cache_read_tokens`)
+    - `cache_read_tokens`: cached prompt tokens
+    - `output_tokens`: total generated tokens (includes `thinking_tokens`)
+    - `thinking_tokens`: reasoning subset of `output_tokens`
+    """
 
     input_tokens: int = 0
     output_tokens: int = 0
     thinking_tokens: int = 0
     cache_read_tokens: int = 0
     total_tokens: int = 0
+
+    @property
+    def total_input_tokens(self) -> int:
+        """Total effective prompt tokens (non-cached + cached)."""
+        return self.input_tokens + self.cache_read_tokens
 
 
 @dataclass(frozen=True)
@@ -229,6 +241,44 @@ def _parse_usage(raw_usage: dict | None) -> UsageInfo:
         thinking_tokens=int(raw_usage.get("thinking_tokens") or 0),
         cache_read_tokens=int(raw_usage.get("cache_read_tokens") or 0),
         total_tokens=int(raw_usage.get("total_tokens") or 0),
+    )
+
+
+def _has_nonzero_usage(usage: UsageInfo) -> bool:
+    return any(
+        (
+            usage.input_tokens,
+            usage.output_tokens,
+            usage.thinking_tokens,
+            usage.cache_read_tokens,
+            usage.total_tokens,
+        )
+    )
+
+
+def _aggregate_turn_usage(step_usages: Dict[Any, UsageInfo]) -> UsageInfo:
+    """Compute accurate per-turn usage from `step_update.usage` entries for THIS turn only.
+
+    `agy --conversation` reports session-cumulative totals in the final `result.usage`
+    event (summing every turn since Turn 1), whereas each `step_update.usage` reports
+    that single inference step. Within one turn (which may involve multiple internal steps,
+    e.g., reading staged media via `read_file`), the active context window size is the
+    final step's `(input_tokens, cache_read_tokens)` while generated tokens sum across
+    this turn's steps only.
+    """
+    ordered = list(step_usages.values())
+    if not ordered:
+        return UsageInfo()
+    last = ordered[-1]
+    out_tok = sum(u.output_tokens for u in ordered)
+    think_tok = sum(u.thinking_tokens for u in ordered)
+    total_tok = last.input_tokens + last.cache_read_tokens + out_tok
+    return UsageInfo(
+        input_tokens=last.input_tokens,
+        output_tokens=out_tok,
+        thinking_tokens=think_tok,
+        cache_read_tokens=last.cache_read_tokens,
+        total_tokens=total_tok,
     )
 
 
@@ -476,6 +526,8 @@ class AgyRunner:
         emitted_text = False
         got_result = False
         latest_usage = UsageInfo()
+        step_usages: Dict[Any, UsageInfo] = {}
+        anon_step_seq = 0
         latest_finish_reason: Optional[str] = None
         active_conv_id = expected_conv_id or ""
         deadline = time.monotonic() + timeout_seconds
@@ -540,8 +592,17 @@ class AgyRunner:
                             f"Requested conversation '{expected_conv_id}' mismatched step '{step_cid}'"
                         )
                     active_conv_id = step_cid or active_conv_id
-                    if "usage" in step:
-                        latest_usage = _parse_usage(step.get("usage"))
+                    if isinstance(step.get("usage"), dict):
+                        parsed_u = _parse_usage(step.get("usage"))
+                        if _has_nonzero_usage(parsed_u):
+                            raw_step_idx = step.get("step_index")
+                            if raw_step_idx is not None:
+                                step_key: Any = raw_step_idx
+                            else:
+                                step_key = f"__anon_{anon_step_seq}"
+                                anon_step_seq += 1
+                            step_usages[step_key] = parsed_u
+                            latest_usage = _aggregate_turn_usage(step_usages)
                     raw_fr = (
                         step.get("finish_reason")
                         or step.get("stop_reason")
@@ -570,7 +631,10 @@ class AgyRunner:
                             f"Requested conversation '{expected_conv_id}' mismatched result '{res_cid}'"
                         )
                     active_conv_id = res_cid or active_conv_id
-                    if result.get("usage") is not None:
+                    if step_usages:
+                        # Prefer per-turn aggregated `step_update.usage` over session-cumulative `result.usage`
+                        latest_usage = _aggregate_turn_usage(step_usages)
+                    elif isinstance(result.get("usage"), dict):
                         latest_usage = _parse_usage(result.get("usage"))
                     raw_fr = (
                         result.get("finish_reason")
