@@ -1,0 +1,37 @@
+{
+	servers {
+		protocols h1 h2
+		timeouts {
+			read_body 10m
+			read_header 30s
+			write 0
+			idle 5m
+		}
+	}
+}
+
+{$AGY_GATEWAY_DOMAIN:gateway.example.com} {
+	request_body {
+		max_size 100MB
+	}
+	reverse_proxy agy-gateway:8787 {
+		flush_interval -1
+		transport http {
+			dial_timeout 10s
+			response_header_timeout 0
+		}
+	}
+}
+
+http://{$AGY_GATEWAY_PUBLIC_IP:127.0.0.1} {
+	request_body {
+		max_size 100MB
+	}
+	reverse_proxy agy-gateway:8787 {
+		flush_interval -1
+		transport http {
+			dial_timeout 10s
+			response_header_timeout 0
+		}
+	}
+}

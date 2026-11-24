@@ -1,0 +1,82 @@
+services:
+  mihomo:
+    image: metacubex/mihomo:latest
+    container_name: agy-mihomo
+    restart: unless-stopped
+    command: ["-d", "/root/.config/mihomo"]
+    ports:
+      - "127.0.0.1:7890:7890"
+      - "127.0.0.1:9090:9090"
+    volumes:
+      - ./mihomo:/root/.config/mihomo
+
+  agy-gateway:
+    build:
+      context: .
+      network: host
+      args:
+        HTTP_PROXY: "http://127.0.0.1:7890"
+        HTTPS_PROXY: "http://127.0.0.1:7890"
+        http_proxy: "http://127.0.0.1:7890"
+        https_proxy: "http://127.0.0.1:7890"
+    image: agy-api-gateway:latest
+    container_name: agy-api-gateway
+    restart: unless-stopped
+    depends_on:
+      - mihomo
+    ports:
+      - "0.0.0.0:8787:8787"
+    environment:
+      AGY_GATEWAY_HOST: "0.0.0.0"
+      AGY_GATEWAY_PORT: "8787"
+      AGY_GATEWAY_AGY_BIN: "/usr/local/bin/agy"
+      AGY_GATEWAY_WORKDIR: "/app/data/agy-workdir"
+      AGY_GATEWAY_DB_PATH: "/app/data/gateway.db"
+      AGY_GATEWAY_DATABASE_URL: "${AGY_GATEWAY_DATABASE_URL:-}"
+      AGY_GATEWAY_ACCOUNTS_DIR: "/app/data/accounts"
+      AGY_GATEWAY_SANDBOX: "false"
+      AGY_GATEWAY_MAX_CONCURRENCY: "${AGY_GATEWAY_MAX_CONCURRENCY:-12}"
+      AGY_GATEWAY_QUEUE_TIMEOUT_SECONDS: "${AGY_GATEWAY_QUEUE_TIMEOUT_SECONDS:-300}"
+      AGY_GATEWAY_REQUEST_TIMEOUT_SECONDS: "${AGY_GATEWAY_REQUEST_TIMEOUT_SECONDS:-600}"
+      AGY_GATEWAY_SSE_KEEPALIVE_SECONDS: "${AGY_GATEWAY_SSE_KEEPALIVE_SECONDS:-10}"
+      AGY_GATEWAY_MAX_PROMPT_BYTES: "${AGY_GATEWAY_MAX_PROMPT_BYTES:-191500}"
+      AGY_GATEWAY_COMPACTION_MODE: "${AGY_GATEWAY_COMPACTION_MODE:-deterministic}"
+      AGY_GATEWAY_COMPACTION_MODEL: "${AGY_GATEWAY_COMPACTION_MODEL:-}"
+      AGY_GATEWAY_COMPACTION_KEEP_RECENT_BYTES: "${AGY_GATEWAY_COMPACTION_KEEP_RECENT_BYTES:-96000}"
+      AGY_GATEWAY_COMPACTION_CHECKPOINT_MAX_BYTES: "${AGY_GATEWAY_COMPACTION_CHECKPOINT_MAX_BYTES:-24000}"
+      AGY_GATEWAY_COMPACTION_TOOL_OUTPUT_MAX_BYTES: "${AGY_GATEWAY_COMPACTION_TOOL_OUTPUT_MAX_BYTES:-12000}"
+      AGY_GATEWAY_COMPACTION_CACHE_TTL_HOURS: "${AGY_GATEWAY_COMPACTION_CACHE_TTL_HOURS:-24}"
+      AGY_GATEWAY_OVERFLOW_MAX_RETRIES: "${AGY_GATEWAY_OVERFLOW_MAX_RETRIES:-2}"
+      AGY_GATEWAY_SESSION_REUSE_ENABLED: "${AGY_GATEWAY_SESSION_REUSE_ENABLED:-true}"
+      AGY_GATEWAY_SESSION_TTL_HOURS: "${AGY_GATEWAY_SESSION_TTL_HOURS:-24}"
+      AGY_GATEWAY_ARTIFACT_RETENTION_MINUTES: "${AGY_GATEWAY_ARTIFACT_RETENTION_MINUTES:-30}"
+      AGY_GATEWAY_ADMIN_KEY: "${AGY_GATEWAY_ADMIN_KEY:-}"
+      HTTP_PROXY: "http://mihomo:7890"
+      HTTPS_PROXY: "http://mihomo:7890"
+      ALL_PROXY: "socks5h://mihomo:7890"
+      http_proxy: "http://mihomo:7890"
+      https_proxy: "http://mihomo:7890"
+      all_proxy: "socks5h://mihomo:7890"
+      NO_PROXY: "127.0.0.1,localhost,mihomo"
+      no_proxy: "127.0.0.1,localhost,mihomo"
+    volumes:
+      - ./data:/app/data
+      - ./data/gemini:/root/.gemini
+      - ./data/config:/root/.config
+
+  caddy:
+    image: caddy:latest
+    container_name: agy-caddy
+    restart: unless-stopped
+    depends_on:
+      - agy-gateway
+    ports:
+      - "0.0.0.0:80:80"
+      - "0.0.0.0:443:443"
+    environment:
+      AGY_GATEWAY_DOMAIN: "${AGY_GATEWAY_DOMAIN:-gateway.example.com}"
+      AGY_GATEWAY_PUBLIC_IP: "${AGY_GATEWAY_PUBLIC_IP:-127.0.0.1}"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./data/caddy/data:/data
+      - ./data/caddy/config:/config

@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.env
+data/
+mihomo/
+*.db
+*.db-shm
+*.db-wal
+*.bak*
+.DS_Store
+dist/
+build/
+*.egg-info/
